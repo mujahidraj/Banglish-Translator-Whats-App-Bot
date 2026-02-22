@@ -78,6 +78,11 @@ Text: "${banglishText}"`;
     }
 }
 
+// Keep-alive ping route for UptimeRobot
+app.get('/', (req, res) => {
+    res.send('✅ Banglish Bot is awake and running!');
+});
+
 app.listen(PORT, () => {
     console.log(`🚀 Banglish Bot Server running on port ${PORT}`);
 });
