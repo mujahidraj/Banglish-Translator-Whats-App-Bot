@@ -71,14 +71,20 @@ app.post('/webhook', async (req, res) => {
 
 // Process Text using Llama-3.3-70b-versatile
 async function processText(text, targetLangs, recipientPhone) {
-    const prompt = `You are an expert translator. Translate the following text into these languages: ${targetLangs}. 
-    Format your response cleanly with the language name or flag first. Do not add extra chat or explanations.
-    Text: "${text}"`;
+    // The System Prompt lays down the absolute law
+    const systemPrompt = `You are a strict, direct translator machine. Your ONLY job is to translate the user's text into: ${targetLangs}.
+    Rules:
+    1. Output ONLY the translations.
+    2. Format exactly as: [Language Flag] [Language Name]: [Translation]
+    3. Do NOT add any introductions, greetings, explanations, or extra text whatsoever.`;
 
     const chatCompletion = await groq.chat.completions.create({
-        messages: [{ role: 'user', content: prompt }],
+        messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: text }
+        ],
         model: 'llama-3.3-70b-versatile',
-        temperature: 0.3, // Keeps translations highly accurate and less "creative"
+        temperature: 0.1, // Lowered to 0.1 for strict, robotic accuracy
     });
 
     await sendMessage(recipientPhone, chatCompletion.choices[0].message.content.trim());
@@ -91,7 +97,7 @@ async function processAudio(mediaId, targetLangs, recipientPhone) {
         headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
     });
     
-    // 2. Download audio stream to a temporary file (Whisper requires a real file, not just base64)
+    // 2. Download audio stream to a temporary file
     const tempFilePath = path.join(os.tmpdir(), `audio_${Date.now()}.ogg`);
     const audioRes = await axios.get(mediaRes.data.url, {
         headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
@@ -113,23 +119,25 @@ async function processAudio(mediaId, targetLangs, recipientPhone) {
     });
     
     const transcriptText = transcription.text;
+    fs.unlinkSync(tempFilePath); // Clean up temp file
 
-    // Clean up the temp file so your server doesn't run out of storage
-    fs.unlinkSync(tempFilePath);
-
-    // 4. Translate the transcript using Llama 3.3
-    const prompt = `You are an expert translator. 
-    Here is a transcript of what the user just said: "${transcriptText}"
+    // 4. Strict Translation of the transcript using Llama 3.3
+    const systemPrompt = `You are a strict translation machine. 
+    I will provide a transcribed text. You must output EXACTLY this format and absolutely nothing else:
     
-    Format your reply exactly like this:
-    🎙️ Transcript: ${transcriptText}
+    🎙️ Transcript: [Insert original text here]
     🌍 Translations:
-    [Translate to ${targetLangs} formatted cleanly]`;
+    [Language Flag] [Language Name]: [Translation]
+    
+    Do NOT add any extra conversational text, notes, definitions, or preambles.`;
 
     const chatCompletion = await groq.chat.completions.create({
-        messages: [{ role: 'user', content: prompt }],
+        messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: transcriptText }
+        ],
         model: 'llama-3.3-70b-versatile',
-        temperature: 0.3,
+        temperature: 0.1,
     });
 
     await sendMessage(recipientPhone, chatCompletion.choices[0].message.content.trim());
