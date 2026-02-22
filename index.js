@@ -1,20 +1,20 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const Groq = require('groq-sdk'); // Swapped Gemini for Groq
 
 const app = express();
 app.use(express.json());
 
-const { PORT, WHATSAPP_TOKEN, PHONE_NUMBER_ID, VERIFY_TOKEN, GEMINI_API_KEY } = process.env;
+// Note: You need a GROQ_API_KEY in your .env now instead of GEMINI_API_KEY
+const { PORT, WHATSAPP_TOKEN, PHONE_NUMBER_ID, VERIFY_TOKEN, GROQ_API_KEY } = process.env;
 
-// Initialize Gemini
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+// Initialize Groq
+const groq = new Groq({ apiKey: GROQ_API_KEY });
 
-// --- IN-MEMORY DATABASE ---
-// This temporarily stores user language preferences. 
-// Default is English and Bangla.
 const userLanguages = {}; 
 const DEFAULT_LANGS = "English and Bangla";
 
@@ -33,26 +33,22 @@ app.get('/webhook', (req, res) => {
 
 // 2. Receive Incoming WhatsApp Messages
 app.post('/webhook', async (req, res) => {
-    // Acknowledge receipt immediately
     res.sendStatus(200);
 
     const body = req.body;
     if (body.object && body.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) {
         const message = body.entry[0].changes[0].value.messages[0];
         const senderPhone = message.from; 
-        
-        // Check what languages this specific user wants
         const targetLangs = userLanguages[senderPhone] || DEFAULT_LANGS;
 
         try {
             if (message.type === 'text') {
                 const textBody = message.text.body;
                 
-                // Handle the /lang command
                 if (textBody.toLowerCase().startsWith('/lang ')) {
                     const newLangs = textBody.replace('/lang ', '').trim();
                     userLanguages[senderPhone] = newLangs;
-                    await sendMessage(senderPhone, `✅ Language updated! I will now translate to: ${newLangs}. Send me text or voice!`);
+                    await sendMessage(senderPhone, `✅ Language updated! I will now translate to: ${newLangs}.`);
                     return;
                 }
 
@@ -61,7 +57,7 @@ app.post('/webhook', async (req, res) => {
 
             } else if (message.type === 'audio') {
                 console.log(`Received Audio ID: ${message.audio.id}`);
-                await sendMessage(senderPhone, "🎧 Listening and translating...");
+                await sendMessage(senderPhone, "🎧 Listening and translating (via Llama 3.3)...");
                 await processAudio(message.audio.id, targetLangs, senderPhone);
             }
         } catch (error) {
@@ -73,47 +69,70 @@ app.post('/webhook', async (req, res) => {
 
 // --- HELPER FUNCTIONS ---
 
-// Process Standard Text
+// Process Text using Llama-3.3-70b-versatile
 async function processText(text, targetLangs, recipientPhone) {
-    const prompt = `You are a translator. Translate the following text into these languages: ${targetLangs}. 
-    Format your response cleanly with the language name or flag first. Do not add extra chat.
+    const prompt = `You are an expert translator. Translate the following text into these languages: ${targetLangs}. 
+    Format your response cleanly with the language name or flag first. Do not add extra chat or explanations.
     Text: "${text}"`;
 
-    const result = await model.generateContent(prompt);
-    await sendMessage(recipientPhone, result.response.text().trim());
+    const chatCompletion = await groq.chat.completions.create({
+        messages: [{ role: 'user', content: prompt }],
+        model: 'llama-3.3-70b-versatile',
+        temperature: 0.3, // Keeps translations highly accurate and less "creative"
+    });
+
+    await sendMessage(recipientPhone, chatCompletion.choices[0].message.content.trim());
 }
 
-// Download Audio from Meta and Process with Gemini
+// Process Audio (Whisper -> Llama 3.3)
 async function processAudio(mediaId, targetLangs, recipientPhone) {
-    // 1. Ask Meta for the media URL
+    // 1. Get Meta URL
     const mediaRes = await axios.get(`https://graph.facebook.com/v18.0/${mediaId}`, {
         headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
     });
-    const mediaUrl = mediaRes.data.url;
-
-    // 2. Download the actual audio file buffer
-    const audioRes = await axios.get(mediaUrl, {
+    
+    // 2. Download audio stream to a temporary file (Whisper requires a real file, not just base64)
+    const tempFilePath = path.join(os.tmpdir(), `audio_${Date.now()}.ogg`);
+    const audioRes = await axios.get(mediaRes.data.url, {
         headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
-        responseType: 'arraybuffer'
+        responseType: 'stream'
     });
     
-    // 3. Convert to Base64 for Gemini
-    const base64Audio = Buffer.from(audioRes.data).toString('base64');
+    const writer = fs.createWriteStream(tempFilePath);
+    audioRes.data.pipe(writer);
 
-    // 4. Send audio + prompt to Gemini
-    const prompt = `You are a translator. Listen to this audio carefully. First, write down the original transcript. Then, translate it into these languages: ${targetLangs}. 
-    Format like this:
-    🎙️ Transcript: [what they said]
+    await new Promise((resolve, reject) => {
+        writer.on('finish', resolve);
+        writer.on('error', reject);
+    });
+
+    // 3. Transcribe audio to text using Whisper
+    const transcription = await groq.audio.transcriptions.create({
+        file: fs.createReadStream(tempFilePath),
+        model: 'whisper-large-v3',
+    });
+    
+    const transcriptText = transcription.text;
+
+    // Clean up the temp file so your server doesn't run out of storage
+    fs.unlinkSync(tempFilePath);
+
+    // 4. Translate the transcript using Llama 3.3
+    const prompt = `You are an expert translator. 
+    Here is a transcript of what the user just said: "${transcriptText}"
+    
+    Format your reply exactly like this:
+    🎙️ Transcript: ${transcriptText}
     🌍 Translations:
-    [Language 1]: [translation]
-    [Language 2]: [translation]`;
+    [Translate to ${targetLangs} formatted cleanly]`;
 
-    const result = await model.generateContent([
-        prompt,
-        { inlineData: { data: base64Audio, mimeType: 'audio/ogg' } }
-    ]);
+    const chatCompletion = await groq.chat.completions.create({
+        messages: [{ role: 'user', content: prompt }],
+        model: 'llama-3.3-70b-versatile',
+        temperature: 0.3,
+    });
 
-    await sendMessage(recipientPhone, result.response.text().trim());
+    await sendMessage(recipientPhone, chatCompletion.choices[0].message.content.trim());
 }
 
 // Unified Send Message Function
@@ -136,11 +155,5 @@ async function sendMessage(recipientPhone, text) {
     console.log('✅ Reply sent.');
 }
 
-// Keep-alive ping route
-app.get('/', (req, res) => {
-    res.send('✅ Banglish Bot is awake and listening!');
-});
-
-app.listen(PORT, () => {
-    console.log(`🚀 Banglish Bot Server running on port ${PORT}`);
-});
+app.get('/', (req, res) => res.send('✅ Banglish Bot (Llama Edition) is awake!'));
+app.listen(PORT, () => console.log(`🚀 Banglish Bot Server running on port ${PORT}`));
